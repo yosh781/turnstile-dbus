@@ -1,5 +1,5 @@
 /**
- * turnstile-dbus v2.6.3 - Extended version
+ * turnstile-dbus v2.6.4 - Extended version
  * Native org.turnstile.login1 interface
  * Power via D-Bus signals for dinit-dbus
  * Permission check via UID (no polkit dependency)
@@ -74,6 +74,17 @@ static int polkit_enabled = 1;
 static int fallback_enabled = 1;
 static char *shutdown_wall_message = NULL;
 static int max_inhibit_delay = 30;
+
+/* Home edition flags */
+static int inhibit_mode = 0;           /* 0=normal, 1=delayed, 2=ignore */
+static int inhibit_timeout = 30;
+static int idle_session_timeout = 0;
+static int kill_user_processes = 0;
+static char *handle_lid_switch = NULL; /* suspend/hibernate/lock/ignore/poweroff */
+static char *handle_power_key = NULL;  /* poweroff/reboot/suspend/hibernate/ignore */
+static char *handle_suspend_key = NULL;
+
+/* Home edition flags */
 static int enable_scheduled = 1;
 
 /* Runtime state */
@@ -102,83 +113,124 @@ static void signal_handler(int sig) {
 
 static void read_config(void) {
     FILE *f = fopen("/etc/turnstile/turnstile-dbus.conf", "r");
-    if (!f) return;
+    if (!f) {
+        /* Set defaults even if no config file */
+        if (!suspend_method) suspend_method = strdup("auto");
+        if (!hibernate_method) hibernate_method = strdup("auto");
+        if (!default_seat) default_seat = strdup("seat0");
+        if (!handle_lid_switch) handle_lid_switch = strdup("suspend");
+        if (!handle_power_key) handle_power_key = strdup("poweroff");
+        if (!handle_suspend_key) handle_suspend_key = strdup("suspend");
+        if (!shutdown_wall_message) shutdown_wall_message = strdup("System is going down for maintenance");
+        return;
+    }
+
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || *p == '[') continue;
+
         char key[128], value[128];
         /* Manual parse: key = value # comment */
         char *eq = strchr(p, '=');
-        if (eq) {
-            char *kstart = p;
-            char *kend = eq - 1;
-            while (kend >= kstart && (*kend == ' ' || *kend == '\t')) kend--;
-            size_t klen = kend - kstart + 1;
-            if (klen >= sizeof(key)) klen = sizeof(key) - 1;
-            memcpy(key, kstart, klen);
-            key[klen] = '\0';
-            char *vstart = eq + 1;
-            while (*vstart == ' ' || *vstart == '\t') vstart++;
-            char *vend = vstart + strlen(vstart) - 1;
-            while (vend >= vstart && (*vend == ' ' || *vend == '\t' || *vend == '\n')) vend--;
-            char *comment = strchr(vstart, '#');
-            if (comment && comment <= vend) vend = comment - 1;
-            while (vend >= vstart && (*vend == ' ' || *vend == '\t')) vend--;
-            size_t vlen = vend - vstart + 1;
-            if (vlen >= sizeof(value)) vlen = sizeof(value) - 1;
-            memcpy(value, vstart, vlen);
-            value[vlen] = '\0';
-        } else {
-            continue;
-        }
+        if (!eq) continue;
+
+        /* Parse key */
+        char *kstart = p;
+        char *kend = eq - 1;
+        while (kend >= kstart && (*kend == ' ' || *kend == '\t')) kend--;
+        size_t klen = kend - kstart + 1;
+        if (klen >= sizeof(key)) klen = sizeof(key) - 1;
+        memcpy(key, kstart, klen);
+        key[klen] = '\0';
+
+        /* Parse value */
+        char *vstart = eq + 1;
+        while (*vstart == ' ' || *vstart == '\t') vstart++;
+        char *vend = vstart + strlen(vstart) - 1;
+        while (vend >= vstart && (*vend == ' ' || *vend == '\t' || *vend == '\n')) vend--;
+        char *comment = strchr(vstart, '#');
+        if (comment && comment <= vend) vend = comment - 1;
+        while (vend >= vstart && (*vend == ' ' || *vend == '\t')) vend--;
+        size_t vlen = vend - vstart + 1;
+        if (vlen >= sizeof(value)) vlen = sizeof(value) - 1;
+        memcpy(value, vstart, vlen);
+        value[vlen] = '\0';
+
         if (key[0] == '\0' || value[0] == '\0') continue;
-        {
-            if (strcmp(key, "ENABLE_SYSLOG") == 0)
-                enable_syslog = (strcmp(value, "1") == 0);
-            else if (strcmp(key, "power_management") == 0)
-                power_management = (strcmp(value, "true") == 0);
-            else if (strcmp(key, "suspend_method") == 0) {
-                if (suspend_method) free(suspend_method);
-                suspend_method = strdup(value);
-            }
-            else if (strcmp(key, "hibernate_method") == 0) {
-                if (hibernate_method) free(hibernate_method);
-                hibernate_method = strdup(value);
-            }
-            else if (strcmp(key, "auto_activate_sessions") == 0)
-                auto_activate_sessions = (strcmp(value, "true") == 0);
-            else if (strcmp(key, "default_seat") == 0) {
-                if (default_seat) free(default_seat);
-                default_seat = strdup(value);
-            }
-            else if (strcmp(key, "dbus_timeout") == 0)
-                dbus_timeout = atoi(value);
-            else if (strcmp(key, "polkit_enabled") == 0)
-                polkit_enabled = (strcmp(value, "true") == 0);
-            else if (strcmp(key, "fallback_enabled") == 0)
-                fallback_enabled = (strcmp(value, "true") == 0);
-            else if (strcmp(key, "shutdown_wall_message") == 0) {
-                if (shutdown_wall_message) free(shutdown_wall_message);
-                shutdown_wall_message = strdup(value);
-            }
-            else if (strcmp(key, "max_inhibit_delay") == 0)
-                max_inhibit_delay = atoi(value);
-            else if (strcmp(key, "second_bus_name") == 0) {
-                if (second_bus_name) free(second_bus_name);
-                second_bus_name = strdup(value);
-            }
-            else if (strcmp(key, "enable_scheduled_shutdown") == 0)
-                enable_scheduled = (strcmp(value, "true") == 0);
+
+        /* Process configuration */
+        if (strcmp(key, "ENABLE_SYSLOG") == 0)
+            enable_syslog = (strcmp(value, "1") == 0);
+        else if (strcmp(key, "power_management") == 0)
+            power_management = (strcmp(value, "true") == 0);
+        else if (strcmp(key, "suspend_method") == 0) {
+            if (suspend_method) free(suspend_method);
+            suspend_method = strdup(value);
         }
+        else if (strcmp(key, "hibernate_method") == 0) {
+            if (hibernate_method) free(hibernate_method);
+            hibernate_method = strdup(value);
+        }
+        else if (strcmp(key, "auto_activate_sessions") == 0)
+            auto_activate_sessions = (strcmp(value, "true") == 0);
+        else if (strcmp(key, "default_seat") == 0) {
+            if (default_seat) free(default_seat);
+            default_seat = strdup(value);
+        }
+        else if (strcmp(key, "dbus_timeout") == 0)
+            dbus_timeout = atoi(value);
+        else if (strcmp(key, "polkit_enabled") == 0)
+            polkit_enabled = (strcmp(value, "true") == 0);
+        else if (strcmp(key, "fallback_enabled") == 0)
+            fallback_enabled = (strcmp(value, "true") == 0);
+        else if (strcmp(key, "shutdown_wall_message") == 0) {
+            if (shutdown_wall_message) free(shutdown_wall_message);
+            shutdown_wall_message = strdup(value);
+        }
+        else if (strcmp(key, "inhibit_mode") == 0) {
+            if (strcmp(value, "ignore") == 0) inhibit_mode = 2;
+            else if (strcmp(value, "delayed") == 0) inhibit_mode = 1;
+            else inhibit_mode = 0;
+        }
+        else if (strcmp(key, "inhibit_timeout") == 0)
+            inhibit_timeout = atoi(value);
+        else if (strcmp(key, "idle_session_timeout") == 0)
+            idle_session_timeout = atoi(value);
+        else if (strcmp(key, "kill_user_processes_on_logout") == 0)
+            kill_user_processes = (strcmp(value, "true") == 0);
+        else if (strcmp(key, "handle_lid_switch") == 0) {
+            if (handle_lid_switch) free(handle_lid_switch);
+            handle_lid_switch = strdup(value);
+        }
+        else if (strcmp(key, "handle_power_key") == 0) {
+            if (handle_power_key) free(handle_power_key);
+            handle_power_key = strdup(value);
+        }
+        else if (strcmp(key, "handle_suspend_key") == 0) {
+            if (handle_suspend_key) free(handle_suspend_key);
+            handle_suspend_key = strdup(value);
+        }
+        else if (strcmp(key, "max_inhibit_delay") == 0)
+            max_inhibit_delay = atoi(value);
+        else if (strcmp(key, "second_bus_name") == 0) {
+            if (second_bus_name) free(second_bus_name);
+            second_bus_name = strdup(value);
+        }
+        else if (strcmp(key, "enable_scheduled_shutdown") == 0)
+            enable_scheduled = (strcmp(value, "true") == 0);
     }
-    fclose(f);
-    
-    /* Set defaults if not configured */
+
+    fclose(f);  /* Close file AFTER the loop */
+
+    /* Set defaults for unset options - AFTER the loop */
     if (!suspend_method) suspend_method = strdup("auto");
     if (!hibernate_method) hibernate_method = strdup("auto");
     if (!default_seat) default_seat = strdup("seat0");
+    if (!handle_lid_switch) handle_lid_switch = strdup("suspend");
+    if (!handle_power_key) handle_power_key = strdup("poweroff");
+    if (!handle_suspend_key) handle_suspend_key = strdup("suspend");
     if (!shutdown_wall_message) shutdown_wall_message = strdup("System is going down for maintenance");
 }
 
@@ -192,6 +244,8 @@ static void do_power_off(void) {
         if (pid == 0) {
             execl("/usr/bin/wall", "wall", shutdown_wall_message, NULL);
             _exit(1);
+        } else if (pid > 0) {
+            waitpid(pid, NULL, 0);
         }
     }
     sync();
@@ -207,6 +261,14 @@ static void do_power_off(void) {
         sync();
         reboot(RB_POWER_OFF);
         _exit(1);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            LOG_ERROR_MSG("dbus-send failed, using direct reboot");
+            sync();
+            reboot(RB_POWER_OFF);
+        }
     }
 }
 
@@ -217,6 +279,8 @@ static void do_reboot(void) {
         if (pid == 0) {
             execl("/usr/bin/wall", "wall", shutdown_wall_message, NULL);
             _exit(1);
+        } else if (pid > 0) {
+            waitpid(pid, NULL, 0);
         }
     }
     sync();
@@ -232,6 +296,14 @@ static void do_reboot(void) {
         sync();
         reboot(RB_AUTOBOOT);
         _exit(1);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            LOG_ERROR_MSG("dbus-send failed, using direct reboot");
+            sync();
+            reboot(RB_AUTOBOOT);
+        }
     }
 }
 
@@ -249,6 +321,8 @@ static void do_suspend(void) {
                 close(fd);
             }
             _exit(1);
+        } else if (pid > 0) {
+            waitpid(pid, NULL, 0);
         }
     } else {
         LOG_INFO_MSG("Suspend: writing mem to /sys/power/state");
@@ -275,6 +349,8 @@ static void do_hibernate(void) {
             close(fd);
         }
         _exit(1);
+    } else if (pid > 0) {
+        waitpid(pid, NULL, 0);
     }
 }
 
@@ -451,16 +527,37 @@ static void handle_inhibit(DBusMessage *msg) {
         DBUS_TYPE_STRING, &mode,
         DBUS_TYPE_INVALID)) {
         DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected what,who,why,mode");
-    dbus_connection_send(conn, err, NULL);
-    dbus_message_unref(err);
+    if (err) {
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+    }
     return;
         }
 
-        /* Permission check */
+        /* Permission check first */
         if (!check_permission(msg)) {
             DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_ACCESS_DENIED, "Permission denied");
-            dbus_connection_send(conn, err, NULL);
-            dbus_message_unref(err);
+            if (err) {
+                dbus_connection_send(conn, err, NULL);
+                dbus_message_unref(err);
+            }
+            return;
+        }
+
+        /* Home edition: check inhibit mode - ignore all inhibitors if mode=2 */
+        if (inhibit_mode == 2) {
+            LOG_INFO_MSG("Inhibit IGNORED (inhibit_mode=ignore)");
+            int pipe_fds[2];
+            if (pipe(pipe_fds) == 0) {
+                DBusMessage *reply = dbus_message_new_method_return(msg);
+                if (reply) {
+                    dbus_message_append_args(reply, DBUS_TYPE_UNIX_FD, &pipe_fds[1], DBUS_TYPE_INVALID);
+                    dbus_connection_send(conn, reply, NULL);
+                    dbus_message_unref(reply);
+                }
+                close(pipe_fds[0]);
+                close(pipe_fds[1]);
+            }
             return;
         }
 
@@ -468,9 +565,17 @@ static void handle_inhibit(DBusMessage *msg) {
         int pipe_fds[2];
         if (pipe(pipe_fds) < 0) {
             DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create pipe");
-            dbus_connection_send(conn, err, NULL);
-            dbus_message_unref(err);
+            if (err) {
+                dbus_connection_send(conn, err, NULL);
+                dbus_message_unref(err);
+            }
             return;
+        }
+
+        /* Set non-blocking for the read end */
+        int flags = fcntl(pipe_fds[0], F_GETFL, 0);
+        if (flags != -1) {
+            fcntl(pipe_fds[0], F_SETFL, flags | O_NONBLOCK);
         }
 
         void *tmp = realloc(inhibitors, (inhibitors_count + 1) * sizeof(InhibitorLock));
@@ -478,8 +583,10 @@ static void handle_inhibit(DBusMessage *msg) {
             close(pipe_fds[0]);
             close(pipe_fds[1]);
             DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_NO_MEMORY, "Failed to allocate inhibitor");
-            dbus_connection_send(conn, err, NULL);
-            dbus_message_unref(err);
+            if (err) {
+                dbus_connection_send(conn, err, NULL);
+                dbus_message_unref(err);
+            }
             return;
         }
         inhibitors = tmp;
@@ -771,7 +878,6 @@ static void handle_list_users(DBusMessage *msg) {
     dbus_message_unref(reply);
 }
 /* CreateSession for KDE compatibility */
-/* CreateSession for KDE compatibility */
 static void handle_create_session(DBusMessage *msg) {
     dbus_uint32_t uid, pid = 0;
     const char *service = "", *type = "unspecified", *class_type = "user";
@@ -780,7 +886,7 @@ static void handle_create_session(DBusMessage *msg) {
     const char *tty = "", *display = "";
     dbus_bool_t remote = FALSE;
     const char *remote_user = "", *remote_host = "";
-    
+
     if (!dbus_message_get_args(msg, NULL,
         DBUS_TYPE_UINT32, &uid, DBUS_TYPE_UINT32, &pid,
         DBUS_TYPE_STRING, &service, DBUS_TYPE_STRING, &type,
@@ -790,64 +896,74 @@ static void handle_create_session(DBusMessage *msg) {
         DBUS_TYPE_BOOLEAN, &remote, DBUS_TYPE_STRING, &remote_user,
         DBUS_TYPE_STRING, &remote_host, DBUS_TYPE_INVALID)) {
         DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected uid,pid,...");
+    if (err) {
         dbus_connection_send(conn, err, NULL);
         dbus_message_unref(err);
-        return;
     }
-    
-    /* Get existing sessions */
-    unsigned long session_id = 0;
-    turnstile_session *sessions = NULL;
-    size_t count = 0;
-    
-    if (turnstile_get_sessions(&sessions, &count) == 0 && count > 0) {
-        for (size_t i = 0; i < count; i++) {
-            if (sessions[i].uid == uid) {
-                session_id = sessions[i].id;
-                break;
+    return;
+        }
+
+        /* Get existing sessions */
+        unsigned long session_id = 0;
+        turnstile_session *sessions = NULL;
+        size_t count = 0;
+
+        if (turnstile_get_sessions(&sessions, &count) == 0 && count > 0) {
+            for (size_t i = 0; i < count; i++) {
+                if (sessions[i].uid == uid) {
+                    session_id = sessions[i].id;
+                    break;
+                }
+            }
+            turnstile_free_sessions(sessions, count);
+        }
+
+        if (session_id == 0) {
+            turnstile_session session;
+            memset(&session, 0, sizeof(session));
+            session.uid = uid;
+
+            if (turnstile_create_session(&session, &session_id) < 0 || session_id == 0) {
+                DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create session");
+                if (err) {
+                    dbus_connection_send(conn, err, NULL);
+                    dbus_message_unref(err);
+                }
+                return;
             }
         }
-        turnstile_free_sessions(sessions, count);
-    }
-    
-    if (session_id == 0) {
-        turnstile_session session;
-        memset(&session, 0, sizeof(session));
-        session.uid = uid;
-        
-        if (turnstile_create_session(&session, &session_id) < 0 || session_id == 0) {
-            DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create session");
-            dbus_connection_send(conn, err, NULL);
-            dbus_message_unref(err);
-            return;
+
+        /* Get DRM fd from seatd */
+        int drm_fd = seatd_helper_get_drm_fd(session_id);
+
+        char session_path[64], id_buf[32];
+        snprintf(session_path, sizeof(session_path), "/org/turnstile/login1/session/%lu", session_id);
+        snprintf(id_buf, sizeof(id_buf), "%lu", session_id);
+        const char *objpath = session_path, *session_id_str = id_buf;
+
+        DBusMessage *reply = dbus_message_new_method_return(msg);
+        if (reply) {
+            dbus_message_append_args(reply,
+                                     DBUS_TYPE_STRING, &session_id_str,
+                                     DBUS_TYPE_OBJECT_PATH, &objpath,
+                                     DBUS_TYPE_STRING, &objpath,
+                                     DBUS_TYPE_UNIX_FD, &drm_fd,
+                                     DBUS_TYPE_STRING, &seat_id,
+                                     DBUS_TYPE_UINT32, &vtnr,
+                                     DBUS_TYPE_BOOLEAN, &remote,
+                                     DBUS_TYPE_STRING, &remote_user,
+                                     DBUS_TYPE_STRING, &remote_host,
+                                     DBUS_TYPE_INVALID);
+            dbus_connection_send(conn, reply, NULL);
+            dbus_message_unref(reply);
         }
-    }
-    
-    /* Get DRM fd from seatd */
-    int drm_fd = seatd_helper_get_drm_fd(session_id);
-    
-    char session_path[64], id_buf[32];
-    snprintf(session_path, sizeof(session_path), "/org/turnstile/login1/session/%lu", session_id);
-    snprintf(id_buf, sizeof(id_buf), "%lu", session_id);
-    const char *objpath = session_path, *session_id_str = id_buf;
-    
-    DBusMessage *reply = dbus_message_new_method_return(msg);
-    if (reply) {
-        dbus_message_append_args(reply,
-            DBUS_TYPE_STRING, &session_id_str,
-            DBUS_TYPE_OBJECT_PATH, &objpath,
-            DBUS_TYPE_STRING, &objpath,
-            DBUS_TYPE_UNIX_FD, &drm_fd,
-            DBUS_TYPE_STRING, &seat_id,
-            DBUS_TYPE_UINT32, &vtnr,
-            DBUS_TYPE_BOOLEAN, &remote,
-            DBUS_TYPE_STRING, &remote_user,
-            DBUS_TYPE_STRING, &remote_host,
-            DBUS_TYPE_INVALID);
-        dbus_connection_send(conn, reply, NULL);
-        dbus_message_unref(reply);
-    }
-    LOG_INFO_MSG("CreateSession: uid=%u session=%lu drm_fd=%d", uid, session_id, drm_fd);
+
+        /* Close our copy of the fd after sending to client */
+        if (drm_fd >= 0) {
+            close(drm_fd);
+        }
+
+        LOG_INFO_MSG("CreateSession: uid=%u session=%lu drm_fd=%d", uid, session_id, drm_fd);
 }
 
 static void handle_release_session(DBusMessage *msg) {
@@ -1662,6 +1778,32 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     return DBUS_HANDLER_RESULT_HANDLED;
 }
 
+static void check_inhibitors(void) {
+    for (int i = inhibitors_count - 1; i >= 0; i--) {
+        char buf[1];
+        ssize_t n = read(inhibitors[i].fd, buf, sizeof(buf));
+        if (n == 0) {
+            /* Client closed the fd - inhibitor released */
+            LOG_INFO_MSG("Inhibitor released: %s", inhibitors[i].name);
+            close(inhibitors[i].fd);
+            free(inhibitors[i].name);
+            free(inhibitors[i].description);
+
+            /* Remove from array */
+            if (i < inhibitors_count - 1) {
+                memmove(&inhibitors[i], &inhibitors[i+1],
+                        (inhibitors_count - i - 1) * sizeof(InhibitorLock));
+            }
+            inhibitors_count--;
+
+            void *tmp = realloc(inhibitors, inhibitors_count * sizeof(InhibitorLock));
+            if (tmp || inhibitors_count == 0) {
+                inhibitors = tmp;
+            }
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
@@ -1673,8 +1815,8 @@ int main(int argc, char *argv[]) {
 
 
     LOG_INFO_MSG("Starting turnstile-dbus v%s", VERSION);
-    LOG_INFO_MSG("Config: power_management=%d, fallback=%d, scheduled=%d",
-                 power_management, fallback_enabled, enable_scheduled);
+    LOG_INFO_MSG("Config: power=%d, fallback=%d, scheduled=%d, inhibit_mode=%d, idle_timeout=%d",
+                 power_management, fallback_enabled, enable_scheduled, inhibit_mode, idle_session_timeout);
 
     if (geteuid() != 0) {
         LOG_ERROR_MSG("Must be run as root!");
@@ -1756,6 +1898,31 @@ int main(int argc, char *argv[]) {
     LOG_INFO_MSG("Ready to handle requests (v%s)", VERSION);
 
     while (running) {
+        /* Check for released inhibitors */
+        check_inhibitors();
+
+        /* Check for idle sessions */
+        if (idle_session_timeout > 0) {
+            static time_t last_check = 0;
+            time_t now = time(NULL);
+            if (now - last_check >= 30) {
+                last_check = now;
+                turnstile_session *sessions = NULL;
+                size_t count = 0;
+                if (turnstile_get_sessions(&sessions, &count) == 0) {
+                    for (size_t i = 0; i < count; i++) {
+                        if (sessions[i].idle_since > 0 &&
+                            (time_t)sessions[i].idle_since > idle_session_timeout) {
+                            LOG_INFO_MSG("Killing idle session %lu (idle for %ld sec)",
+                                         sessions[i].id, (time_t)sessions[i].idle_since);
+                            turnstile_stop_session(sessions[i].id);
+                            }
+                    }
+                    turnstile_free_sessions(sessions, count);
+                }
+            }
+        }
+
         dbus_connection_read_write_dispatch(conn, 50);
 
         /* Check scheduled shutdown */
@@ -1771,6 +1938,7 @@ int main(int argc, char *argv[]) {
                 } else {
                     do_power_off();
                 }
+                if (sched_shutdown->wall_message) free(sched_shutdown->wall_message);
                 free(sched_shutdown);
                 sched_shutdown = NULL;
             }
@@ -1796,7 +1964,18 @@ int main(int argc, char *argv[]) {
         dbus_connection_unref(conn);
         conn = NULL;
     }
-
+    if (handle_lid_switch) {
+        free(handle_lid_switch);
+        handle_lid_switch = NULL;
+    }
+    if (handle_power_key) {
+        free(handle_power_key);
+        handle_power_key = NULL;
+    }
+    if (handle_suspend_key) {
+        free(handle_suspend_key);
+        handle_suspend_key = NULL;
+    }
     /* Cleanup */
     if (sched_shutdown) {
         if (sched_shutdown->wall_message) free(sched_shutdown->wall_message);
