@@ -271,6 +271,14 @@ sudo dinitctl restart turnstile-dbus
 
 Changelog
 
+v2.6.4
+
+### Added
+- Disable unnecessary functions in /etc/turnstile/turnstile-dbus.conf
+### Fixed
+- Memory leaks
+- Inhibitors are correctly created and released
+
 v2.6.3
 
 ### Added
