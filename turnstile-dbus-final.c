@@ -1,5 +1,5 @@
 /**
- * turnstile-dbus v2.6.4 - Extended version
+ * turnstile-dbus v2.6.5 - Extended version
  * Native org.turnstile.login1 interface
  * Power via D-Bus signals for dinit-dbus
  * Permission check via UID (no polkit dependency)
@@ -37,7 +37,7 @@
 #define BUS_IFACE "org.turnstile.login1.Manager"
 #define BUS_OBJ "/org/turnstile/login1"
 #define LOGIND_IFACE "org.freedesktop.login1.Manager"
-#define VERSION "2.6.3"
+#define VERSION "2.6.5"
 
 static char *second_bus_name = NULL;
 
@@ -57,6 +57,7 @@ typedef struct {
 
 static DBusConnection *conn = NULL;
 static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t reload_config_flag = 0;
 static pthread_mutex_t monitor_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t monitor_cond = PTHREAD_COND_INITIALIZER;
 static turnstile *ts_monitor = NULL;
@@ -74,6 +75,12 @@ static int polkit_enabled = 1;
 static int fallback_enabled = 1;
 static char *shutdown_wall_message = NULL;
 static int max_inhibit_delay = 30;
+
+/* Forward declarations */
+static void check_inhibitors(void);
+static int send_reply_safe(DBusMessage *reply);
+static int send_error_safe(DBusMessage *error);
+static void wait_for_inhibitors(void);
 
 /* Home edition flags */
 static int inhibit_mode = 0;           /* 0=normal, 1=delayed, 2=ignore */
@@ -98,9 +105,7 @@ static InhibitorLock *inhibitors = NULL;
 static void read_config(void);
 static void signal_handler(int sig) {
     if (sig == SIGHUP) {
-        LOG_INFO_MSG("SIGHUP received, reloading config");
-        read_config();
-        LOG_INFO_MSG("Config reloaded");
+        reload_config_flag = 1;  /* Только выставляем флаг */
         return;
     }
     LOG_INFO_MSG("Signal %d received, shutting down", sig);
@@ -237,8 +242,33 @@ static void read_config(void) {
 /* Direct system operations */
 static void emit_prepare_for_shutdown(int start);
 static void emit_prepare_for_sleep(int start);
+static void wait_for_inhibitors(void) {
+    if (inhibitors_count == 0) return;
+
+    LOG_INFO_MSG("Waiting for %d inhibitor(s) to release...", inhibitors_count);
+    time_t start = time(NULL);
+
+    while (inhibitors_count > 0) {
+        check_inhibitors();
+
+        if (time(NULL) - start > max_inhibit_delay) {
+            LOG_INFO_MSG("Inhibit timeout reached, forcing shutdown");
+            break;
+        }
+
+        usleep(200000);  /* 200ms */
+        dbus_connection_read_write_dispatch(conn, 0);
+    }
+}
+
 static void do_power_off(void) {
     LOG_INFO_MSG("Power off: stopping sessions");
+
+    /* Check for inhibitors in delayed mode */
+    if (inhibit_mode == 1 && inhibitors_count > 0) {
+        wait_for_inhibitors();
+    }
+
     if (shutdown_wall_message) {
         pid_t pid = fork();
         if (pid == 0) {
@@ -338,19 +368,32 @@ static void do_suspend(void) {
 
 static void do_hibernate(void) {
     LOG_INFO_MSG("Hibernate: starting");
-    pid_t pid = fork();
-    if (pid == 0) {
-        execl("/usr/sbin/pm-hibernate", "pm-hibernate", NULL);
-        /* Fallback */
+    if (hibernate_method && strcmp(hibernate_method, "external") == 0) {
+        LOG_INFO_MSG("Hibernate: using external command");
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/usr/sbin/pm-hibernate", "pm-hibernate", NULL);
+            /* Fallback */
+            sync();
+            int fd = open("/sys/power/state", O_WRONLY);
+            if (fd >= 0) {
+                write(fd, "disk", 4);
+                close(fd);
+            }
+            _exit(1);
+        } else if (pid > 0) {
+            waitpid(pid, NULL, 0);
+        }
+    } else {
+        LOG_INFO_MSG("Hibernate: writing disk to /sys/power/state");
         sync();
         int fd = open("/sys/power/state", O_WRONLY);
         if (fd >= 0) {
             write(fd, "disk", 4);
             close(fd);
+        } else {
+            LOG_ERROR_MSG("Hibernate: failed to open /sys/power/state");
         }
-        _exit(1);
-    } else if (pid > 0) {
-        waitpid(pid, NULL, 0);
     }
 }
 
@@ -527,36 +570,33 @@ static void handle_inhibit(DBusMessage *msg) {
         DBUS_TYPE_STRING, &mode,
         DBUS_TYPE_INVALID)) {
         DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected what,who,why,mode");
-    if (err) {
-        dbus_connection_send(conn, err, NULL);
-        dbus_message_unref(err);
-    }
+    send_error_safe(err);
     return;
         }
 
         /* Permission check first */
         if (!check_permission(msg)) {
             DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_ACCESS_DENIED, "Permission denied");
-            if (err) {
-                dbus_connection_send(conn, err, NULL);
-                dbus_message_unref(err);
-            }
+            send_error_safe(err);
             return;
         }
 
         /* Home edition: check inhibit mode - ignore all inhibitors if mode=2 */
         if (inhibit_mode == 2) {
-            LOG_INFO_MSG("Inhibit IGNORED (inhibit_mode=ignore)");
-            int pipe_fds[2];
-            if (pipe(pipe_fds) == 0) {
+            LOG_INFO_MSG("Inhibit IGNORED (inhibit_mode=ignore): what=%s who=%s", what, who);
+
+            /* Return a valid fd even in ignore mode - use /dev/null */
+            int devnull_fd = open("/dev/null", O_RDONLY);
+            if (devnull_fd >= 0) {
                 DBusMessage *reply = dbus_message_new_method_return(msg);
                 if (reply) {
-                    dbus_message_append_args(reply, DBUS_TYPE_UNIX_FD, &pipe_fds[1], DBUS_TYPE_INVALID);
-                    dbus_connection_send(conn, reply, NULL);
-                    dbus_message_unref(reply);
+                    dbus_message_append_args(reply, DBUS_TYPE_UNIX_FD, &devnull_fd, DBUS_TYPE_INVALID);
+                    send_reply_safe(reply);
                 }
-                close(pipe_fds[0]);
-                close(pipe_fds[1]);
+                close(devnull_fd);
+            } else {
+                DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create inhibitor fd");
+                send_error_safe(err);
             }
             return;
         }
@@ -565,10 +605,7 @@ static void handle_inhibit(DBusMessage *msg) {
         int pipe_fds[2];
         if (pipe(pipe_fds) < 0) {
             DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create pipe");
-            if (err) {
-                dbus_connection_send(conn, err, NULL);
-                dbus_message_unref(err);
-            }
+            send_error_safe(err);
             return;
         }
 
@@ -583,10 +620,7 @@ static void handle_inhibit(DBusMessage *msg) {
             close(pipe_fds[0]);
             close(pipe_fds[1]);
             DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_NO_MEMORY, "Failed to allocate inhibitor");
-            if (err) {
-                dbus_connection_send(conn, err, NULL);
-                dbus_message_unref(err);
-            }
+            send_error_safe(err);
             return;
         }
         inhibitors = tmp;
@@ -596,15 +630,19 @@ static void handle_inhibit(DBusMessage *msg) {
         inhibitors[inhibitors_count].fd = pipe_fds[0];  /* Read end for monitoring */
         inhibitors_count++;
 
-        LOG_INFO_MSG("Inhibit: who=%s why=%s what=%s mode=%s", who, why, what, mode);
+        LOG_INFO_MSG("Inhibit: who=%s why=%s what=%s mode=%s (inhibit_mode=%d)",
+                     who, why, what, mode, inhibit_mode);
 
         DBusMessage *reply = dbus_message_new_method_return(msg);
         if (reply) {
             dbus_message_append_args(reply,
                                      DBUS_TYPE_UNIX_FD, &pipe_fds[1],  /* Give write end to client */
                                      DBUS_TYPE_INVALID);
-            dbus_connection_send(conn, reply, NULL);
-            dbus_message_unref(reply);
+            send_reply_safe(reply);
+            /* Don't close pipe_fds[1] here - D-Bus will handle sending it to client */
+            /* The client will close their end when done */
+        } else {
+            close(pipe_fds[1]);  /* Close if we couldn't create reply */
         }
 
         close(pipe_fds[1]);  /* Close our copy of write end */
@@ -632,16 +670,35 @@ static void *monitor_thread_func(void *arg) {
 
     while (1) {
         pthread_mutex_lock(&monitor_mutex);
+
+        /* Check exit condition before waiting */
         if (!running || !ts_monitor) {
             pthread_mutex_unlock(&monitor_mutex);
             break;
         }
+
+        /* timeout 50ms */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 50000000;  /* 50ms */
+        if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000;
+        }
+
+        pthread_cond_timedwait(&monitor_cond, &monitor_mutex, &ts);
+
+        /* Re-check after wakeup */
+        int should_run = running && ts_monitor;
         pthread_mutex_unlock(&monitor_mutex);
+
+        if (!should_run) {
+            break;
+        }
 
         if (ts_monitor) {
             turnstile_dispatch(ts_monitor, 100);
         }
-        usleep(50000);
     }
 
     LOG_INFO_MSG("Monitor thread exiting");
@@ -933,7 +990,7 @@ static void handle_create_session(DBusMessage *msg) {
             }
         }
 
-        /* Get DRM fd from seatd */
+        /* Get DRM fd from seatd only after successful session creation */
         int drm_fd = seatd_helper_get_drm_fd(session_id);
 
         char session_path[64], id_buf[32];
@@ -1376,86 +1433,129 @@ static void handle_properties_get(DBusMessage *msg) {
     const char *iface, *prop;
     if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &prop, DBUS_TYPE_INVALID)) {
         DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected interface and property");
-        dbus_connection_send(conn, err, NULL);
-        dbus_message_unref(err);
+        if (err) {
+            dbus_connection_send(conn, err, NULL);
+            dbus_message_unref(err);
+        }
         return;
     }
+
     DBusMessage *reply = dbus_message_new_method_return(msg);
-    if (!reply) return;
-    DBusMessageIter iter, variant;
+    if (!reply) {
+        LOG_ERROR_MSG("Failed to create reply message");
+        return;
+    }
+
+    DBusMessageIter iter;
     dbus_message_iter_init_append(reply, &iter);
-    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+
     if (strcmp(iface, BUS_IFACE) == 0 || strcmp(iface, LOGIND_IFACE) == 0) {
-        if (strcmp(prop, "ActiveSeat") == 0) {
-            char *seat = NULL;
-            turnstile_get_active_seat(&seat);
-            const char *val = seat ? seat : (default_seat ? default_seat : "seat0");
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-            if (seat) free(seat);
-        } else if (strcmp(prop, "ActiveVTNr") == 0) {
+        if (strcmp(prop, "ActiveVTNr") == 0) {
+            /* ActiveVTNr  uint32 */
+            DBusMessageIter variant;
+            dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "u", &variant);
             unsigned long vtnr = 0;
             turnstile_get_active_vtnr(&vtnr);
             dbus_uint32_t v = vtnr;
             dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &v);
-        } else if (strcmp(prop, "CanPowerOff") == 0) {
-            const char *val = "yes";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else if (strcmp(prop, "CanReboot") == 0) {
-            const char *val = "yes";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else if (strcmp(prop, "CanSuspend") == 0) {
-            const char *val = check_suspend_support() ? "yes" : "no";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else if (strcmp(prop, "CanHibernate") == 0) {
-            const char *val = check_hibernate_support() ? "yes" : "no";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else if (strcmp(prop, "RebootToFirmwareSetup") == 0) {
-            const char *val = "no";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else if (strcmp(prop, "RebootToBootLoaderMenu") == 0) {
-            const char *val = "no";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else if (strcmp(prop, "RebootToBootLoaderEntry") == 0) {
-            const char *val = "no";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+            dbus_message_iter_close_container(&iter, &variant);
         } else {
-            const char *empty = "";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &empty);
+            DBusMessageIter variant;
+            dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+
+            if (strcmp(prop, "ActiveSeat") == 0) {
+                char *seat = NULL;
+                turnstile_get_active_seat(&seat);
+                const char *val = seat ? seat : (default_seat ? default_seat : "seat0");
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+                if (seat) free(seat);
+            } else if (strcmp(prop, "CanPowerOff") == 0) {
+                const char *val = "yes";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+            } else if (strcmp(prop, "CanReboot") == 0) {
+                const char *val = "yes";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+            } else if (strcmp(prop, "CanSuspend") == 0) {
+                const char *val = check_suspend_support() ? "yes" : "no";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+            } else if (strcmp(prop, "CanHibernate") == 0) {
+                const char *val = check_hibernate_support() ? "yes" : "no";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+            } else if (strcmp(prop, "RebootToFirmwareSetup") == 0) {
+                const char *val = "no";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+            } else if (strcmp(prop, "RebootToBootLoaderMenu") == 0) {
+                const char *val = "no";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+            } else if (strcmp(prop, "RebootToBootLoaderEntry") == 0) {
+                const char *val = "no";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+            } else {
+                const char *empty = "";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &empty);
+            }
+
+            dbus_message_iter_close_container(&iter, &variant);
         }
     } else if (strcmp(iface, "org.freedesktop.login1.Seat") == 0 ||
-               strcmp(iface, "org.turnstile.login1.Seat") == 0) {
-        if (strcmp(prop, "ActiveSession") == 0) {
-            const char *val = "/org/freedesktop/login1/session/1";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else if (strcmp(prop, "CanGraphical") == 0) {
-            const char *val = "yes";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else if (strcmp(prop, "Id") == 0) {
-            const char *val = "seat0";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else {
-            const char *empty = "";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &empty);
-        }
-    } else if (strcmp(iface, "org.freedesktop.login1.Session") == 0 ||
-               strcmp(iface, "org.turnstile.login1.Session") == 0) {
-        if (strcmp(prop, "Active") == 0) {
-            dbus_bool_t val = TRUE;
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &val);
-        } else if (strcmp(prop, "State") == 0) {
-            const char *val = "active";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        } else {
-            const char *empty = "";
-            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &empty);
-        }
+        strcmp(iface, "org.turnstile.login1.Seat") == 0) {
+        DBusMessageIter variant;
+    dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+
+    if (strcmp(prop, "ActiveSession") == 0) {
+        const char *val = "/org/freedesktop/login1/session/1";
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+    } else if (strcmp(prop, "CanGraphical") == 0) {
+        const char *val = "yes";
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+    } else if (strcmp(prop, "Id") == 0) {
+        const char *val = "seat0";
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
     } else {
         const char *empty = "";
         dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &empty);
     }
+
     dbus_message_iter_close_container(&iter, &variant);
-    dbus_connection_send(conn, reply, NULL);
-    dbus_message_unref(reply);
+        } else if (strcmp(iface, "org.freedesktop.login1.Session") == 0 ||
+            strcmp(iface, "org.turnstile.login1.Session") == 0) {
+            DBusMessageIter variant;
+        dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+
+        if (strcmp(prop, "Active") == 0) {
+            const char *val = "true";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "State") == 0) {
+            const char *val = "active";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "Remote") == 0) {
+            const char *val = "false";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "Type") == 0) {
+            const char *val = "x11";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "IdleHint") == 0) {
+            const char *val = "false";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "Class") == 0) {
+            const char *val = "user";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else {
+            const char *empty = "";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &empty);
+        }
+
+        dbus_message_iter_close_container(&iter, &variant);
+            } else {
+                DBusMessageIter variant;
+                dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
+                const char *empty = "";
+                dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &empty);
+                dbus_message_iter_close_container(&iter, &variant);
+            }
+
+            dbus_connection_send(conn, reply, NULL);
+            dbus_message_unref(reply);
 }
 
 static void handle_properties_get_all(DBusMessage *msg) {
@@ -1527,28 +1627,111 @@ static void handle_properties_get_all(DBusMessage *msg) {
         dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&array_iter, &entry);
-    } else if (strcmp(iface, "org.freedesktop.login1.Session") == 0 ||
-               strcmp(iface, "org.turnstile.login1.Session") == 0) {
-        /* Session properties */
-        DBusMessageIter entry, variant;
-        const char *prop = "Active";
-        dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
-        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
-        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
-        dbus_bool_t bval = TRUE;
-        dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &bval);
-        dbus_message_iter_close_container(&entry, &variant);
-        dbus_message_iter_close_container(&array_iter, &entry);
-        
-        prop = "State";
-        dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
-        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
-        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
-        const char *val = "active";
-        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
-        dbus_message_iter_close_container(&entry, &variant);
-        dbus_message_iter_close_container(&array_iter, &entry);
-    }
+} else if (strcmp(iface, "org.freedesktop.login1.Session") == 0 ||
+           strcmp(iface, "org.turnstile.login1.Session") == 0) {
+    /* Session properties - полный набор для polkit */
+    DBusMessageIter entry, variant;
+    
+    /* Active */
+    const char *prop = "Active";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
+    dbus_bool_t bval = TRUE;
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &bval);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+    
+    /* State */
+    prop = "State";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+    const char *val = "active";
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+    
+    /* IdleHint */
+    prop = "IdleHint";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
+    bval = FALSE;
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &bval);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+    
+    /* Remote - ВАЖНО для polkit! */
+    prop = "Remote";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
+    bval = FALSE;
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &bval);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+    
+    /* Type */
+    prop = "Type";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+    val = "x11";
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+    
+    /* Class */
+    prop = "Class";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+    val = "user";
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+    
+    /* Desktop */
+    prop = "Desktop";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+    val = "xfce";
+    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+    
+    /* Seat  */
+    prop = "Seat";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "(so)", &variant);
+    DBusMessageIter seat_struct;
+    dbus_message_iter_open_container(&variant, DBUS_TYPE_STRUCT, NULL, &seat_struct);
+    const char *seat_id = "seat0";
+    const char *seat_path = "/org/freedesktop/login1/seat/seat0";
+    dbus_message_iter_append_basic(&seat_struct, DBUS_TYPE_STRING, &seat_id);
+    dbus_message_iter_append_basic(&seat_struct, DBUS_TYPE_OBJECT_PATH, &seat_path);
+    dbus_message_iter_close_container(&variant, &seat_struct);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+    
+    /* User */
+    prop = "User";
+    dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+    dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+    dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "(uo)", &variant);
+    DBusMessageIter user_struct;
+    dbus_message_iter_open_container(&variant, DBUS_TYPE_STRUCT, NULL, &user_struct);
+    dbus_uint32_t uid = 1000;  /* Замените на реальный UID из сессии */
+    const char *user_path = "/org/freedesktop/login1/user/1000";
+    dbus_message_iter_append_basic(&user_struct, DBUS_TYPE_UINT32, &uid);
+    dbus_message_iter_append_basic(&user_struct, DBUS_TYPE_OBJECT_PATH, &user_path);
+    dbus_message_iter_close_container(&variant, &user_struct);
+    dbus_message_iter_close_container(&entry, &variant);
+    dbus_message_iter_close_container(&array_iter, &entry);
+}
     
     dbus_message_iter_close_container(&iter, &array_iter);
     dbus_connection_send(conn, reply, NULL);
@@ -1573,10 +1756,28 @@ static void handle_switch_to_vt(DBusMessage *msg) {
         dbus_message_unref(err);
         return;
     }
+
     LOG_INFO_MSG("SwitchToVT: %u", vtnr);
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "chvt %u", vtnr);
-    system(cmd);
+
+    /* fork/exec */
+    pid_t pid = fork();
+    if (pid == 0) {
+        char vt_str[16];
+        snprintf(vt_str, sizeof(vt_str), "%u", vtnr);
+        execl("/bin/chvt", "chvt", vt_str, NULL);
+        execl("/bin/openvt", "openvt", "-s", "-c", vt_str, "--", "/bin/true", NULL);
+
+        _exit(1);
+    } else if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            LOG_ERROR_MSG("Failed to switch to VT %u", vtnr);
+        }
+    } else {
+        LOG_ERROR_MSG("Failed to fork for VT switch");
+    }
+
     DBusMessage *reply = dbus_message_new_method_return(msg);
     if (reply) {
         dbus_connection_send(conn, reply, NULL);
@@ -1778,31 +1979,127 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     return DBUS_HANDLER_RESULT_HANDLED;
 }
 
+/* ====== Helper Functions (must be before main) ====== */
+
 static void check_inhibitors(void) {
+    if (inhibitors_count == 0) return;
+
+    int removed = 0;
+
     for (int i = inhibitors_count - 1; i >= 0; i--) {
+        /* Check if fd is still valid by trying to read */
         char buf[1];
         ssize_t n = read(inhibitors[i].fd, buf, sizeof(buf));
+
         if (n == 0) {
             /* Client closed the fd - inhibitor released */
-            LOG_INFO_MSG("Inhibitor released: %s", inhibitors[i].name);
+            LOG_INFO_MSG("Inhibitor released: %s (fd=%d)",
+                         inhibitors[i].name ? inhibitors[i].name : "unknown",
+                         inhibitors[i].fd);
+
+            /* Close our monitoring fd */
             close(inhibitors[i].fd);
-            free(inhibitors[i].name);
-            free(inhibitors[i].description);
 
-            /* Remove from array */
-            if (i < inhibitors_count - 1) {
-                memmove(&inhibitors[i], &inhibitors[i+1],
-                        (inhibitors_count - i - 1) * sizeof(InhibitorLock));
+            /* Free strings */
+            if (inhibitors[i].name) {
+                free(inhibitors[i].name);
             }
-            inhibitors_count--;
+            if (inhibitors[i].description) {
+                free(inhibitors[i].description);
+            }
 
-            void *tmp = realloc(inhibitors, inhibitors_count * sizeof(InhibitorLock));
-            if (tmp || inhibitors_count == 0) {
-                inhibitors = tmp;
-            }
+            /* Mark as removed */
+            inhibitors[i].fd = -1;
+            inhibitors[i].name = NULL;
+            inhibitors[i].description = NULL;
+            removed++;
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            /* Error reading - fd might be invalid */
+            LOG_ERROR_MSG("Error checking inhibitor fd %d: %s",
+                          inhibitors[i].fd, strerror(errno));
+
+            close(inhibitors[i].fd);
+            if (inhibitors[i].name) free(inhibitors[i].name);
+            if (inhibitors[i].description) free(inhibitors[i].description);
+
+            inhibitors[i].fd = -1;
+            inhibitors[i].name = NULL;
+            inhibitors[i].description = NULL;
+            removed++;
         }
     }
+
+    /* Compact the array if any inhibitors were removed */
+    if (removed > 0) {
+        int write_idx = 0;
+        for (int i = 0; i < inhibitors_count; i++) {
+            if (inhibitors[i].fd >= 0) {
+                if (write_idx != i) {
+                    inhibitors[write_idx] = inhibitors[i];
+                }
+                write_idx++;
+            }
+        }
+
+        inhibitors_count = write_idx;
+
+        if (inhibitors_count > 0) {
+            void *tmp = realloc(inhibitors, inhibitors_count * sizeof(InhibitorLock));
+            if (tmp) {
+                inhibitors = tmp;
+            }
+        } else {
+            free(inhibitors);
+            inhibitors = NULL;
+        }
+
+        LOG_INFO_MSG("Compacted inhibitors array: removed %d, remaining %d",
+                     removed, inhibitors_count);
+    }
 }
+
+static void cleanup_all_inhibitors(void) {
+    if (inhibitors_count == 0) return;
+
+    LOG_INFO_MSG("Cleaning up %d inhibitors during shutdown", inhibitors_count);
+
+    for (int i = 0; i < inhibitors_count; i++) {
+        if (inhibitors[i].fd >= 0) {
+            close(inhibitors[i].fd);
+        }
+        if (inhibitors[i].name) {
+            free(inhibitors[i].name);
+        }
+        if (inhibitors[i].description) {
+            free(inhibitors[i].description);
+        }
+    }
+
+    free(inhibitors);
+    inhibitors = NULL;
+    inhibitors_count = 0;
+}
+
+static int send_reply_safe(DBusMessage *reply) {
+    if (!reply) return 0;
+    dbus_bool_t ret = dbus_connection_send(conn, reply, NULL);
+    dbus_message_unref(reply);
+    if (!ret) {
+        LOG_ERROR_MSG("Failed to send D-Bus reply: out of memory or connection lost");
+    }
+    return ret;
+}
+
+static int send_error_safe(DBusMessage *error) {
+    if (!error) return 0;
+    dbus_bool_t ret = dbus_connection_send(conn, error, NULL);
+    dbus_message_unref(error);
+    if (!ret) {
+        LOG_ERROR_MSG("Failed to send D-Bus error: out of memory or connection lost");
+    }
+    return ret;
+}
+/* ====== End of Helper Functions ====== */
 
 int main(int argc, char *argv[]) {
     (void)argc;
@@ -1898,32 +2195,16 @@ int main(int argc, char *argv[]) {
     LOG_INFO_MSG("Ready to handle requests (v%s)", VERSION);
 
     while (running) {
-        /* Check for released inhibitors */
-        check_inhibitors();
-
-        /* Check for idle sessions */
-        if (idle_session_timeout > 0) {
-            static time_t last_check = 0;
-            time_t now = time(NULL);
-            if (now - last_check >= 30) {
-                last_check = now;
-                turnstile_session *sessions = NULL;
-                size_t count = 0;
-                if (turnstile_get_sessions(&sessions, &count) == 0) {
-                    for (size_t i = 0; i < count; i++) {
-                        if (sessions[i].idle_since > 0 &&
-                            (time_t)sessions[i].idle_since > idle_session_timeout) {
-                            LOG_INFO_MSG("Killing idle session %lu (idle for %ld sec)",
-                                         sessions[i].id, (time_t)sessions[i].idle_since);
-                            turnstile_stop_session(sessions[i].id);
-                            }
-                    }
-                    turnstile_free_sessions(sessions, count);
-                }
-            }
+        if (reload_config_flag) {
+            reload_config_flag = 0;
+            LOG_INFO_MSG("Reloading config...");
+            read_config();
+            LOG_INFO_MSG("Config reloaded");
         }
 
         dbus_connection_read_write_dispatch(conn, 50);
+
+            check_inhibitors();
 
         /* Check scheduled shutdown */
         if (sched_shutdown && sched_shutdown->active && enable_scheduled) {
@@ -2002,14 +2283,8 @@ int main(int argc, char *argv[]) {
         free(default_seat);
         default_seat = NULL;
     }
-    for (int i = 0; i < inhibitors_count; i++) {
-        if (inhibitors[i].name) free(inhibitors[i].name);
-        if (inhibitors[i].description) free(inhibitors[i].description);
-    }
-    if (inhibitors) {
-        free(inhibitors);
-        inhibitors = NULL;
-    }
+    /* Clean up inhibitors properly */
+    cleanup_all_inhibitors();
 
     if (enable_syslog) closelog();
     return 0;
