@@ -68,11 +68,8 @@ static int enable_syslog = 1;
 static int power_management = 1;
 static char *suspend_method = NULL;
 static char *hibernate_method = NULL;
-static int auto_activate_sessions = 1;
 static char *default_seat = NULL;
 static int dbus_timeout = 30000;
-static int polkit_enabled = 1;
-static int fallback_enabled = 1;
 static char *shutdown_wall_message = NULL;
 static int max_inhibit_delay = 30;
 
@@ -178,18 +175,12 @@ static void read_config(void) {
             if (hibernate_method) free(hibernate_method);
             hibernate_method = strdup(value);
         }
-        else if (strcmp(key, "auto_activate_sessions") == 0)
-            auto_activate_sessions = (strcmp(value, "true") == 0);
         else if (strcmp(key, "default_seat") == 0) {
             if (default_seat) free(default_seat);
             default_seat = strdup(value);
         }
         else if (strcmp(key, "dbus_timeout") == 0)
             dbus_timeout = atoi(value);
-        else if (strcmp(key, "polkit_enabled") == 0)
-            polkit_enabled = (strcmp(value, "true") == 0);
-        else if (strcmp(key, "fallback_enabled") == 0)
-            fallback_enabled = (strcmp(value, "true") == 0);
         else if (strcmp(key, "shutdown_wall_message") == 0) {
             if (shutdown_wall_message) free(shutdown_wall_message);
             shutdown_wall_message = strdup(value);
@@ -644,8 +635,6 @@ static void handle_inhibit(DBusMessage *msg) {
         } else {
             close(pipe_fds[1]);  /* Close if we couldn't create reply */
         }
-
-        close(pipe_fds[1]);  /* Close our copy of write end */
 }
 
 /* Turnstile event callback */
@@ -2112,8 +2101,8 @@ int main(int argc, char *argv[]) {
 
 
     LOG_INFO_MSG("Starting turnstile-dbus v%s", VERSION);
-    LOG_INFO_MSG("Config: power=%d, fallback=%d, scheduled=%d, inhibit_mode=%d, idle_timeout=%d",
-                 power_management, fallback_enabled, enable_scheduled, inhibit_mode, idle_session_timeout);
+    LOG_INFO_MSG("Config: power=%d, scheduled=%d, inhibit_mode=%d, idle_timeout=%d",
+                 power_management, enable_scheduled, inhibit_mode, idle_session_timeout);
 
     if (geteuid() != 0) {
         LOG_ERROR_MSG("Must be run as root!");
