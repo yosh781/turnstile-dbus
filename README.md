@@ -271,6 +271,15 @@ sudo dinitctl restart turnstile-dbus
 
 Changelog
 
+v2.6.5.2
+### Added
+SetLockedHint
+HybridSleep
+SuspendThenHibernate
+LockSession
+UnlockSession
+emit_session_lock
+
 v2.6.4
 
 ### Added
