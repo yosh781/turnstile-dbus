@@ -1,5 +1,5 @@
 /**
- * turnstile-dbus v2.6.5 - Extended version
+ * turnstile-dbus v2.6.5.2 - Extended version
  * Native org.turnstile.login1 interface
  * Power via D-Bus signals for dinit-dbus
  * Permission check via UID (no polkit dependency)
@@ -30,6 +30,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <syslog.h>
+#include <sys/sysinfo.h>
 #include "seatd-helper.h"
 
 #define BUS_NAME "org.turnstile.login1"
@@ -37,7 +38,7 @@
 #define BUS_IFACE "org.turnstile.login1.Manager"
 #define BUS_OBJ "/org/turnstile/login1"
 #define LOGIND_IFACE "org.freedesktop.login1.Manager"
-#define VERSION "2.6.5"
+#define VERSION "2.6.5.2"
 
 static char *second_bus_name = NULL;
 
@@ -78,6 +79,10 @@ static void check_inhibitors(void);
 static int send_reply_safe(DBusMessage *reply);
 static int send_error_safe(DBusMessage *error);
 static void wait_for_inhibitors(void);
+static int is_system_awake(void);
+static int check_hibernation_restore(void);
+static void *wake_signal_thread(void *arg);
+static void *hibernate_wake_signal_thread(void *arg);
 
 /* Home edition flags */
 static int inhibit_mode = 0;           /* 0=normal, 1=delayed, 2=ignore */
@@ -233,6 +238,11 @@ static void read_config(void) {
 /* Direct system operations */
 static void emit_prepare_for_shutdown(int start);
 static void emit_prepare_for_sleep(int start);
+static unsigned long session_id_from_path(const char *path);
+static void handle_hibernate(DBusMessage *msg);
+static void handle_lock_session_manager(DBusMessage *msg);
+static void handle_unlock_session_manager(DBusMessage *msg);
+
 static void wait_for_inhibitors(void) {
     if (inhibitors_count == 0) return;
 
@@ -388,6 +398,93 @@ static void do_hibernate(void) {
     }
 }
 
+static int is_system_awake(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    
+
+    FILE *f = fopen("/proc/uptime", "r");
+    if (f) {
+        double uptime, idle;
+        if (fscanf(f, "%lf %lf", &uptime, &idle) == 2) {
+            fclose(f);
+            LOG_INFO_MSG("System uptime: %.2f seconds", uptime);
+            return uptime > 1.0;
+        }
+        fclose(f);
+    }
+    
+    return 1;  
+}
+
+static int check_hibernation_restore(void) {
+
+    FILE *f = fopen("/sys/power/resume", "r");
+    if (f) {
+        char buf[256];
+        if (fgets(buf, sizeof(buf), f)) {
+            fclose(f);
+            if (strstr(buf, "0:0") == NULL) {
+                LOG_INFO_MSG("System restored from hibernation: %s", buf);
+                return 1;
+            }
+        } else {
+            fclose(f);
+        }
+    }
+    
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        if (si.uptime < 60) {
+            LOG_INFO_MSG("System uptime is %ld seconds - likely restored from hibernation", 
+                        si.uptime);
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+static void *wake_signal_thread(void *arg) {
+    (void)arg;
+    
+    sleep(3);
+    
+    if (!is_system_awake()) {
+        LOG_ERROR_MSG("System doesn't appear to be awake");
+        return NULL;
+    }
+    
+    LOG_INFO_MSG("System is awake, sending wake signal");
+    
+    emit_prepare_for_sleep(0);
+    dbus_connection_flush(conn);
+    
+    return NULL;
+}
+
+static void *hibernate_wake_signal_thread(void *arg) {
+    (void)arg;
+    
+    sleep(7);
+    
+    if (check_hibernation_restore()) {
+        LOG_INFO_MSG("System restored from hibernation, sending wake signal");
+    } else {
+        LOG_INFO_MSG("System appears to be running normally, sending wake signal");
+    }
+    
+    emit_prepare_for_sleep(0);
+    dbus_connection_flush(conn);
+    
+    sleep(2);
+    LOG_INFO_MSG("Sending duplicate wake signal after hibernation");
+    emit_prepare_for_sleep(0);
+    dbus_connection_flush(conn);
+    
+    return NULL;
+}
+
 static int check_suspend_support(void) {
     /* Check if suspend-to-ram is available */
     char buf[64];
@@ -443,6 +540,38 @@ static void emit_prepare_for_sleep(int start) {
     }
 }
 
+/* Emit org.freedesktop.login1.Session.Lock / Unlock on the session path,
+ * and also the native org.turnstile.login1.Session variant, so that
+ * any DE (Enlightenment, etc.) subscribed to either name picks it up. */
+static void
+emit_session_lock(unsigned long session_id, int locked)
+{
+    const char *sig = locked ? "Lock" : "Unlock";
+    const char *paths[2] = {
+        "/org/freedesktop/login1/session/%lu",
+        "/org/turnstile/login1/session/%lu"
+    };
+    const char *ifaces[2] = {
+        "org.freedesktop.login1.Session",
+        "org.turnstile.login1.Session"
+    };
+    char pbuf[64];
+    int i, j;
+
+    for (i = 0; i < 2; i++)
+      {
+         snprintf(pbuf, sizeof(pbuf), paths[i], session_id);
+         for (j = 0; j < 2; j++)
+           {
+              DBusMessage *signal = dbus_message_new_signal(pbuf, ifaces[j], sig);
+              if (!signal) continue;
+              dbus_connection_send(conn, signal, NULL);
+              dbus_message_unref(signal);
+           }
+      }
+    dbus_connection_flush(conn);
+}
+
 /* Permission check via D-Bus UID */
 static int check_permission(DBusMessage *msg) {
     const char *sender = dbus_message_get_sender(msg);
@@ -479,6 +608,70 @@ static int check_permission(DBusMessage *msg) {
 
     LOG_INFO_MSG("check_permission: uid=%lu denied (no sessions)", uid);
     return 0;
+}
+
+/* Handle org.freedesktop.login1.Session.SetLockedHint(b).
+ * Enlightenment (e_sys_locked_set) calls this whenever the screen is locked. */
+static void handle_set_locked_hint(DBusMessage *msg) {
+    dbus_bool_t locked = FALSE;
+    const char *path = dbus_message_get_path(msg);
+    unsigned long session_id = session_id_from_path(path);
+
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_BOOLEAN, &locked, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected boolean");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    LOG_INFO_MSG("SetLockedHint: session=%lu locked=%d", session_id, locked);
+
+    /* Best-effort: mirror the hint into the session state machine. */
+    if (session_id > 0)
+        turnstile_set_session_state(session_id, locked ? "locking" : "online");
+
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+}
+
+static void handle_suspend_then_hibernate(DBusMessage *msg) {
+    LOG_INFO_MSG("SuspendThenHibernate: falling back to hibernate");
+    handle_hibernate(msg);
+}
+
+static void handle_hybrid_sleep(DBusMessage *msg) {
+    dbus_bool_t interactive = FALSE;
+    dbus_message_get_args(msg, NULL, DBUS_TYPE_BOOLEAN, &interactive, DBUS_TYPE_INVALID);
+    (void)interactive;
+
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+    dbus_connection_flush(conn);
+
+    emit_prepare_for_sleep(1);
+    dbus_connection_flush(conn);
+
+    LOG_INFO_MSG("Preparing for hybrid sleep...");
+    usleep(2000000);
+
+    sync();
+
+    /* Try platform-mode hybrid: write "platform" to /sys/power/disk,
+     * then "mem" to /sys/power/state. Fall back to plain suspend. */
+    int fd = open("/sys/power/disk", O_WRONLY);
+    if (fd >= 0) {
+        if (write(fd, "platform", 8) < 0)
+            LOG_ERROR_MSG("HybridSleep: failed to write platform to /sys/power/disk");
+        close(fd);
+    } else {
+        LOG_INFO_MSG("HybridSleep: /sys/power/disk unavailable, falling back to suspend");
+    }
+
+    do_suspend();
+
+    LOG_INFO_MSG("System restored from hybrid sleep");
+    sleep(5);
+    emit_prepare_for_sleep(0);
+    dbus_connection_flush(conn);
 }
 
 /* New functions for v2.4.0 */
@@ -1099,7 +1292,6 @@ static void handle_set_session_idle(DBusMessage *msg) {
     LOG_INFO_MSG("SetIdleHint: session=%lu idle=%d", session_id, idle);
 }
 
-/* SetSessionState for KDE */
 static void handle_set_session_state(DBusMessage *msg) {
     const char *session_id_str, *state;
     if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &session_id_str, DBUS_TYPE_STRING, &state, DBUS_TYPE_INVALID)) {
@@ -1113,8 +1305,70 @@ static void handle_set_session_state(DBusMessage *msg) {
     DBusMessage *reply = dbus_message_new_method_return(msg);
     if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
     LOG_INFO_MSG("SetSessionState: session=%lu state=%s", session_id, state);
+
+    /* Emit Lock/Unlock signals so that subscribed desktop environments
+     * (Enlightenment, etc.) can react to external lock requests. */
+    if (strcmp(state, "online") == 0)
+        emit_session_lock(session_id, 0 /* unlock */);
+    else
+        emit_session_lock(session_id, 1 /* lock */);
 }
 
+/* Handle org.freedesktop.login1.Session.Lock / .Unlock
+ * These take no arguments and are called on the session object path. */
+static void handle_session_lock(DBusMessage *msg, int locked) {
+    const char *path = dbus_message_get_path(msg);
+    unsigned long session_id = session_id_from_path(path);
+
+    if (session_id == 0) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Not a session path");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    turnstile_set_session_state(session_id, locked ? "locking" : "online");
+
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+    LOG_INFO_MSG("Session %s: session=%lu", locked ? "Lock" : "Unlock", session_id);
+
+    /* Emit signals so subscribers (Enlightenment, etc.) get notified. */
+    emit_session_lock(session_id, locked);
+}
+
+/* Handle org.freedesktop.login1.Manager.LockSession(s) */
+static void handle_lock_session_manager(DBusMessage *msg) {
+    const char *sid = NULL;
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &sid, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected session ID");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    unsigned long session_id = strtoul(sid, NULL, 10);
+    turnstile_set_session_state(session_id, "locking");
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+    LOG_INFO_MSG("LockSession (Manager): session=%lu", session_id);
+    emit_session_lock(session_id, 1);
+}
+
+/* Handle org.freedesktop.login1.Manager.UnlockSession(s) */
+static void handle_unlock_session_manager(DBusMessage *msg) {
+    const char *sid = NULL;
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &sid, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected session ID");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    unsigned long session_id = strtoul(sid, NULL, 10);
+    turnstile_set_session_state(session_id, "online");
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+    LOG_INFO_MSG("UnlockSession (Manager): session=%lu", session_id);
+    emit_session_lock(session_id, 0);
+}
 
 static void handle_get_session(DBusMessage *msg) {
     const char *session_id_str;
@@ -1276,6 +1530,7 @@ static void handle_reboot(DBusMessage *msg) {
     do_reboot();
 }
 
+
 static void handle_suspend(DBusMessage *msg) {
     dbus_bool_t interactive = FALSE;
     dbus_message_get_args(msg, NULL, DBUS_TYPE_BOOLEAN, &interactive, DBUS_TYPE_INVALID);
@@ -1290,10 +1545,27 @@ static void handle_suspend(DBusMessage *msg) {
     dbus_connection_flush(conn);
     emit_prepare_for_sleep(1);
     dbus_connection_flush(conn);
-    usleep(500000);
+        
+    usleep(1000000);  
+    
+    if (!check_suspend_support()) {
+        LOG_ERROR_MSG("Suspend not supported, sending wake signal");
+        emit_prepare_for_sleep(0);
+        dbus_connection_flush(conn);
+        return;
+    }
+    
+    LOG_INFO_MSG("System going to sleep...");
     do_suspend();
-
-    /* Send wake-up signal */
+    
+    LOG_INFO_MSG("System woke up, waiting for devices to initialize...");
+    usleep(2000000);  
+    
+    LOG_INFO_MSG("Sending PrepareForSleep(false) signal");
+    emit_prepare_for_sleep(0);
+    dbus_connection_flush(conn);
+    
+    usleep(500000);
     emit_prepare_for_sleep(0);
     dbus_connection_flush(conn);
 }
@@ -1312,10 +1584,36 @@ static void handle_hibernate(DBusMessage *msg) {
     dbus_connection_flush(conn);
     emit_prepare_for_sleep(1);
     dbus_connection_flush(conn);
-    usleep(500000);
+    
+    LOG_INFO_MSG("Preparing for hibernation...");
+    usleep(2000000);  
+    
+    if (!check_hibernate_support()) {
+        LOG_ERROR_MSG("Hibernate not supported, sending wake signal");
+        emit_prepare_for_sleep(0);
+        dbus_connection_flush(conn);
+        return;
+    }
+    
+    sync();
+    
+    LOG_INFO_MSG("System going to hibernate...");
     do_hibernate();
-
-    /* Send wake-up signal */
+    
+    LOG_INFO_MSG("System restored from hibernation, waiting for devices...");
+    
+    sleep(5);  
+    
+    if (!is_system_awake()) {
+        LOG_ERROR_MSG("System doesn't appear to be restored from hibernation");
+    }
+    
+    LOG_INFO_MSG("Sending PrepareForSleep(false) after hibernation");
+    emit_prepare_for_sleep(0);
+    dbus_connection_flush(conn);
+    
+    usleep(1000000);  
+    LOG_INFO_MSG("Sending duplicate PrepareForSleep(false) signal");
     emit_prepare_for_sleep(0);
     dbus_connection_flush(conn);
 }
@@ -1812,6 +2110,8 @@ static void handle_introspect(DBusMessage *msg) {
         "    <method name='CanHibernate'><arg type='s' direction='out'/></method>"
         "    <method name='CanHybridSleep'><arg type='s' direction='out'/></method>"
         "    <method name='CanSuspendThenHibernate'><arg type='s' direction='out'/></method>"
+        "    <method name='HybridSleep'><arg type='b' direction='in'/></method>"
+        "    <method name='SuspendThenHibernate'><arg type='b' direction='in'/></method>"
         "    <method name='SetWallMessage'><arg type='s' direction='in'/></method>"
         "    <method name='ScheduleShutdown'><arg type='s' direction='in'/><arg type='x' direction='in'/></method>"
         "    <method name='CancelScheduledShutdown'/>"
@@ -1853,6 +2153,21 @@ static void handle_introspect(DBusMessage *msg) {
     }
 }
 
+/* Extract session id from object path like
+ * /org/turnstile/login1/session/42 or /org/freedesktop/login1/session/42.
+ * Returns 0 if not a session path. */
+static unsigned long
+session_id_from_path(const char *path)
+{
+    const char *p;
+
+    if (!path) return 0;
+    p = strstr(path, "/session/");
+    if (!p) return 0;
+    p += strlen("/session/");
+    return strtoul(p, NULL, 10);
+}
+
 static DBusHandlerResult message_handler(DBusConnection *connection,
                                           DBusMessage *msg, void *user_data) {
     (void)user_data;
@@ -1878,7 +2193,9 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     /* Handle Session interface for KDE */
     if (strstr(dbus_message_get_path(msg), "/org/freedesktop/login1/session/") ||
         strstr(dbus_message_get_path(msg), "/org/turnstile/login1/session/")) {
-        if (strcmp(member, "Lock") == 0 || strcmp(member, "Unlock") == 0) { handle_set_session_state(msg); return DBUS_HANDLER_RESULT_HANDLED; }
+        if (strcmp(member, "Lock") == 0) { handle_session_lock(msg, 1); return DBUS_HANDLER_RESULT_HANDLED; }
+        if (strcmp(member, "Unlock") == 0) { handle_session_lock(msg, 0); return DBUS_HANDLER_RESULT_HANDLED; }
+        if (strcmp(member, "SetLockedHint") == 0) { handle_set_locked_hint(msg); return DBUS_HANDLER_RESULT_HANDLED; }
         if (strcmp(member, "SetIdleHint") == 0) { handle_set_session_idle(msg); return DBUS_HANDLER_RESULT_HANDLED; }
         if (strcmp(member, "Activate") == 0) { handle_activate_session(msg); return DBUS_HANDLER_RESULT_HANDLED; }
         if (strcmp(member, "TakeControl") == 0) { handle_take_control(msg); return DBUS_HANDLER_RESULT_HANDLED; }
@@ -1903,6 +2220,8 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     /* Permission check for destructive methods */
     if (strcmp(member, "PowerOff") == 0 || strcmp(member, "Reboot") == 0 ||
         strcmp(member, "Suspend") == 0 || strcmp(member, "Hibernate") == 0 ||
+        strcmp(member, "HybridSleep") == 0 ||
+        strcmp(member, "SuspendThenHibernate") == 0 ||
         strcmp(member, "TerminateSession") == 0 ||
         strcmp(member, "TerminateUser") == 0 ||
         strcmp(member, "StopAllSessions") == 0 ||
@@ -1924,8 +2243,8 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     else if (strcmp(member, "GetSessionByPID") == 0) handle_get_session_by_pid(msg);
     else if (strcmp(member, "SetIdleHint") == 0) handle_set_session_idle(msg);
     else if (strcmp(member, "SetSessionState") == 0) handle_set_session_state(msg);
-    else if (strcmp(member, "LockSession") == 0) handle_set_session_state(msg);
-    else if (strcmp(member, "UnlockSession") == 0) handle_set_session_state(msg);
+    else if (strcmp(member, "LockSession") == 0) handle_lock_session_manager(msg);
+    else if (strcmp(member, "UnlockSession") == 0) handle_unlock_session_manager(msg);
     else if (strcmp(member, "CanGraphical") == 0) handle_can_graphical(msg);
     else if (strcmp(member, "ListSeats") == 0) handle_list_seats(msg);
     else 
@@ -1945,6 +2264,8 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     else if (strcmp(member, "Reboot") == 0) handle_reboot(msg);
     else if (strcmp(member, "Suspend") == 0) handle_suspend(msg);
     else if (strcmp(member, "Hibernate") == 0) handle_hibernate(msg);
+    else if (strcmp(member, "HybridSleep") == 0) handle_hybrid_sleep(msg);
+    else if (strcmp(member, "SuspendThenHibernate") == 0) handle_suspend_then_hibernate(msg);
     else if (strcmp(member, "CanPowerOff") == 0) handle_can_power_off(msg);
     else if (strcmp(member, "CanReboot") == 0) handle_can_reboot(msg);
     else if (strcmp(member, "CanSuspend") == 0) handle_can_suspend(msg);
